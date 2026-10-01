@@ -1,6 +1,6 @@
 {
   "name": "pi-image-compact",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Turns images into text for models that cannot accept them, using a vision model, and leaves an inspect_image tool for when the description is not enough.",
   "type": "module",
   "license": "MIT",

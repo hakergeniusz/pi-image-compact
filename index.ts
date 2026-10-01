@@ -242,7 +242,7 @@ function describeWithVisionModel(imagePath: string, prompt: string): Promise<str
 
 /** Describe one image, cached on its bytes and the prompt that asked for it. */
 async function describeImage(block: ImageBlock, prompt: string): Promise<{ text: string; file: string }> {
-	const key = hashOf(`${prompt} ${block.data}`);
+	const key = hashOf(`${prompt}\x00${block.data}`);
 	const hit = cachedDescription(key);
 	if (hit) {
 		// the file may have been cleared while the description survived
@@ -366,6 +366,9 @@ export default function imageCompact(pi: ExtensionAPI): void {
 	 */
 	pi.registerTool({
 		name: "inspect_image",
+		// Deferred: not declared in every request; tool_search finds and
+		// activates it when an image needs a closer look.
+		exposure: "deferred",
 		label: "Inspect image",
 		description:
 			"Describe an image again, in more detail, using a vision model. Use this when an image's " +
