@@ -22,14 +22,20 @@ nothing to look at. `opencode/nemotron-3-ultra-free` answers such a request with
 
 ## What this does
 
-Any image bound for a model that cannot accept one is replaced by a
-description produced by a vision model, so the text-only model gets something
-to work from:
+Any image bound for a model that cannot accept one is replaced by extracted
+text. Primary path: local OCR with tesseract — free, deterministic, no model
+call, cached by content hash. When OCR finds no text (charts, photos,
+diagrams), the image still carries information, so it falls back to a
+description produced by a vision model:
+
+```
+[image — /home/you/.pi/agent/cache/image-compact/eb49a844ca83324e.png]
+The active model cannot accept images, so this image was OCR'd locally (tesseract).
 
 ```
 [image — /home/you/.pi/agent/cache/image-compact/eb49a844ca83324e.png]
 The active model cannot accept images, so a vision model described this one instead.
-If the description is not specific enough, call inspect_image with the path above and a focus.
+If this is not specific enough, call inspect_image with the path above.
 Do not assume it is complete.
 
 Error: ENOENT
@@ -52,6 +58,11 @@ The conversion therefore happens where the bytes still exist:
 |---|---|---|
 | `tool_result` | the read tool returning a png/jpg/gif/webp/bmp | once; the image never enters history |
 | `context` | an image pasted or attached by the user | before every LLM call, cached after the first |
+
+`inspect_image` (deferred, found via `tool_search`) re-extracts with tesseract's
+sparse-text mode (`--psm 11`), which often catches scattered UI text the
+automatic pass merged away, and uses the vision model only when OCR comes back
+empty there too.
 
 ## The trigger, and a trap
 

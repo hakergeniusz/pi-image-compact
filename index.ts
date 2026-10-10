@@ -6,8 +6,10 @@
  * not fail in that case, it quietly drops the picture and leaves a placeholder,
  * so the image is simply gone and the model has nothing to work from.
  *
- * This extension replaces the picture with a text description, produced by a
- * vision-capable model, before the image can be discarded.
+ * This extension replaces the picture with extracted text before the image can
+ * be discarded. Primary path: local OCR (tesseract) — free, deterministic, no
+ * model call. When OCR finds no text (charts, photos, diagrams), the image
+ * still carries information, so it falls back to a vision-model description.
  *
  * ## Why the obvious hook does not work
  *
@@ -16,7 +18,7 @@
  * `transformMessages`, which swaps every image block for the string
  * "(tool image omitted: model n)" *before* that hook is emitted. By the time an
  * extension sees the payload the base64 is gone, so there is nothing left to
- * describe. Anything built on that hook is a no-op.
+ * read. Anything built on that hook is a no-op.
  *
  * So the conversion happens earlier, where the bytes still exist:
  *
@@ -48,12 +50,12 @@
  *
  * ## Cost
  *
- * The description comes from a child `pi` on a vision model, which reuses the
- * credentials pi already holds — no API key is read, stored or forwarded here.
- * Results are cached by content hash, so a screenshot costs one nested call ever
- * rather than one per turn.
+ * OCR is a local tesseract run (cached by content hash), so a text screenshot
+ * costs one OCR ever and no model call. Only when OCR comes back empty does a
+ * child `pi` on a vision model describe the image; that reuses the credentials
+ * pi already holds — no API key is read, stored or forwarded here.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -70,6 +72,12 @@ const VISION_MODEL =
 const TIMEOUT_MS = Number(process.env.PI_IMAGE_COMPACT_TIMEOUT_MS ?? 120_000);
 /** Force conversion even when the model claims to accept images. */
 const FORCE = process.env.PI_IMAGE_COMPACT_FORCE === "1";
+/** Set PI_IMAGE_COMPACT_OCR=0 to skip OCR and always use the vision model. */
+const OCR_DISABLED = process.env.PI_IMAGE_COMPACT_OCR === "0";
+/** Page-segmentation mode for the primary pass: 3 = fully automatic. */
+const OCR_PSM = process.env.PI_IMAGE_COMPACT_OCR_PSM?.trim() || "3";
+/** Page-segmentation mode for inspect_image: 11 = sparse text, good for UIs. */
+const OCR_PSM_SPARSE = process.env.PI_IMAGE_COMPACT_OCR_PSM_SPARSE?.trim() || "11";
 
 /**
  * Asked of the vision model. The reader has never seen the screen, so
@@ -240,31 +248,74 @@ function describeWithVisionModel(imagePath: string, prompt: string): Promise<str
 	});
 }
 
-/** Describe one image, cached on its bytes and the prompt that asked for it. */
-async function describeImage(block: ImageBlock, prompt: string): Promise<{ text: string; file: string }> {
-	const key = hashOf(`${prompt}\x00${block.data}`);
-	const hit = cachedDescription(key);
-	if (hit) {
-		// the file may have been cleared while the description survived
-		return { text: hit, file: materialise(block.data, block.mimeType, key) };
-	}
-	let file: string;
-	try {
-		file = materialise(block.data, block.mimeType, key);
-	} catch (e) {
-		return { text: `[image description unavailable: could not write the image to disk (${String(e)})]`, file: "" };
-	}
-	const text = await describeWithVisionModel(file, prompt);
-	if (!text.startsWith("[image description unavailable")) cacheDescription(key, text);
-	return { text, file };
+/**
+ * OCR one image with tesseract. Resolves "" when tesseract is missing, fails,
+ * or the image contains no readable text — the caller then falls back to the
+ * vision model, because an empty result means the image may still matter.
+ */
+function ocrImage(imagePath: string, psm: string): Promise<string> {
+	return new Promise((resolve) => {
+		const child = spawn("tesseract", [imagePath, "stdout", "-l", "eng", "--psm", psm], {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let out = "";
+		const timer = setTimeout(() => child.kill("SIGKILL"), TIMEOUT_MS);
+		child.stdout.on("data", (d) => {
+			out += String(d);
+		});
+		child.on("error", () => {
+			clearTimeout(timer);
+			resolve("");
+		});
+		child.on("close", () => {
+			clearTimeout(timer);
+			// tesseract pads with form feeds and blank lines; collapse them
+			resolve(out.replace(/\f/g, "").replace(/\n{3,}/g, "\n\n").trim());
+		});
+	});
 }
 
-function renderBlock(index: number, count: number, file: string, description: string): string {
+/** One image, converted for a text-only model: OCR first, vision model as fallback. */
+async function describeImage(block: ImageBlock, prompt: string): Promise<{ text: string; file: string; via: "ocr" | "vision" }> {
+	let file: string;
+	try {
+		file = materialise(block.data, block.mimeType, hashOf(block.data));
+	} catch (e) {
+		return { text: `[image description unavailable: could not write the image to disk (${String(e)})]`, file: "", via: "ocr" };
+	}
+
+	if (!OCR_DISABLED) {
+		// key on the mode, so OCR results never collide with cached vision descriptions
+		const ocrKey = hashOf(`ocr:psm${OCR_PSM}\x00${block.data}`);
+		const hit = cachedDescription(ocrKey);
+		if (hit) return { text: hit, file, via: "ocr" };
+		const ocr = await ocrImage(file, OCR_PSM);
+		if (ocr) {
+			cacheDescription(ocrKey, ocr);
+			return { text: ocr, file, via: "ocr" };
+		}
+	}
+
+	// OCR found nothing (or is disabled): charts, photos and diagrams still
+	// carry information a text-only model can use, so describe with vision.
+	const visionKey = hashOf(`${prompt}\x00${block.data}`);
+	const visionHit = cachedDescription(visionKey);
+	if (visionHit) return { text: visionHit, file, via: "vision" };
+	const text = await describeWithVisionModel(file, prompt);
+	if (!text.startsWith("[image description unavailable")) cacheDescription(visionKey, text);
+	return { text, file, via: "vision" };
+}
+
+function renderBlock(index: number, count: number, file: string, description: string, via: "ocr" | "vision"): string {
 	const which = count > 1 ? ` ${index + 1} of ${count}` : "";
+	const origin =
+		via === "ocr"
+			? `The active model cannot accept images, so this image was OCR'd locally (tesseract).`
+			: `The active model cannot accept images, and OCR found no text, so a vision model described this one instead.`;
 	return [
 		`[image${which} — ${file}]`,
-		`The active model cannot accept images, so a vision model described this one instead.`,
-		`If the description is not specific enough, call inspect_image with the path above and a focus.`,
+		origin,
+		`If this is not specific enough, call inspect_image with the path above.`,
 		`Do not assume it is complete.`,
 		"",
 		description.trim(),
@@ -287,7 +338,7 @@ async function convertBlocks(
 	const described = await Promise.all(images.map((b) => describeImage(b, DESCRIBE_PROMPT)));
 
 	const replacements = new Map<Block, string>();
-	described.forEach((d, i) => replacements.set(images[i], renderBlock(i, images.length, d.file, d.text)));
+	described.forEach((d, i) => replacements.set(images[i], renderBlock(i, images.length, d.file, d.text, d.via)));
 
 	const out: Block[] = [];
 	let converted = false;
@@ -371,10 +422,10 @@ export default function imageCompact(pi: ExtensionAPI): void {
 		exposure: "deferred",
 		label: "Inspect image",
 		description:
-			"Describe an image again, in more detail, using a vision model. Use this when an image's " +
-			"description was not specific enough — pass a focus such as \"the error dialog in the top " +
-			"right\" or \"the value in the second column\". Works even though the active model cannot " +
-			"see images itself.",
+			"Extract an image's text again with local OCR in sparse-text mode (finds scattered UI text the " +
+			"first pass may have missed). Use this when an image's transcription was not specific enough — " +
+			"pass a focus such as \"the error dialog in the top right\" to steer the fallback vision description " +
+			"when OCR finds nothing. Works even though the active model cannot see images itself.",
 		parameters: Type.Object({
 			path: Type.String({ description: "Image path, as given in the description marker." }),
 			focus: Type.Optional(Type.String({ description: "What to look at, if only part of it matters." })),
@@ -400,7 +451,23 @@ export default function imageCompact(pi: ExtensionAPI): void {
 			}
 			const ext = extname(file).toLowerCase();
 			const mime = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : `image/${ext.slice(1) || "png"}`;
-			const { text } = await describeImage({ type: "image", data, mimeType: mime }, prompt);
+			// Sparse-text OCR first: a different segmentation pass often catches
+			// text the automatic pass merged away. Cached on the mode + bytes.
+			if (!OCR_DISABLED) {
+				const sparseKey = hashOf(`ocr:psm${OCR_PSM_SPARSE}\x00${data}`);
+				const hit = cachedDescription(sparseKey);
+				if (hit) return { content: [{ type: "text" as const, text: hit }], details: {} };
+				const ocr = await ocrImage(file, OCR_PSM_SPARSE);
+				if (ocr) {
+					cacheDescription(sparseKey, ocr);
+					return { content: [{ type: "text" as const, text: ocr }], details: {} };
+				}
+			}
+			const visionKey = hashOf(`${prompt}\x00${data}`);
+			const visionHit = cachedDescription(visionKey);
+			if (visionHit) return { content: [{ type: "text" as const, text: visionHit }], details: {} };
+			const text = await describeWithVisionModel(file, prompt);
+			if (!text.startsWith("[image description unavailable")) cacheDescription(visionKey, text);
 			return { content: [{ type: "text" as const, text }], details: {} };
 		},
 	});
